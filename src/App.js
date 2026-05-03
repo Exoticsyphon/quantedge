@@ -642,6 +642,7 @@ function DashScreen({defaultProfile}) {
   }
 
   const [demoModeApplied, setDemoModeApplied] = useState(true);
+  const [loadKey, setLoadKey] = useState(0); // increment to force reload
 
   // ── TUNING PARAMETERS — live adjustable ──────────────────────────
   const [takeProfit,   setTakeProfit]   = useState(0.5);   // %
@@ -976,7 +977,7 @@ function DashScreen({defaultProfile}) {
     }
     load();
     return ()=>{ dead=true; };
-  },[demoMode]);
+  },[demoMode, loadKey]);
 
   // ── CRYPTO PRICE UPDATES: REST polling primary, WS upgrade if available ─
   const wsRef2        = useRef(null);
@@ -2506,7 +2507,16 @@ function DashScreen({defaultProfile}) {
           </div>
 
           {/* ── Apply button ─────────────────────────────────────── */}
-          <button className="rdbtn start" style={{width:"100%",padding:14,fontSize:14}} onClick={()=>{setSettingsOpen(false);setActive(false);setDataReady(false);}}>
+          <button className="rdbtn start" style={{width:"100%",padding:14,fontSize:14}} onClick={()=>{
+            setSettingsOpen(false);
+            setActive(false);
+            setHalted(false);
+            setDataReady(false);
+            setTrades([]);
+            setCryptoWallet({cash:profile.cryptoCapital,positions:{},peak:profile.cryptoCapital});
+            setStockWallet({cash:profile.stockCapital,positions:{},peak:profile.stockCapital,lastRebalance:Date.now(),lastDailyRotation:0});
+            setLoadKey(k=>k+1);
+          }}>
             Apply & Restart Engine
           </button>
           <div style={{textAlign:"center",marginTop:10,fontSize:10,color:"#374151"}}>
