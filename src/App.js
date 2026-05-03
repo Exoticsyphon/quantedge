@@ -1,4 +1,3 @@
-/* eslint-disable */
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -11,19 +10,19 @@ let FINNHUB_KEY = ""; // set at runtime from ConnectScreen
 const CRYPTO_CAPITAL_PCT = 0.65;
 const STOCK_CAPITAL_PCT  = 0.35;
 
-// Crypto scalper config — high performance micro scalping
+// Crypto scalper config — values overridden at runtime by settings panel
 const CRYPTO_CFG = {
-  maxPosPct:      0.06,   // 6% of bucket per position — smaller, more of them
-  maxPosFlat:     300,    // $300 hard cap per trade — keep size small for speed
-  minPosDollar:   5,      // minimum $5 trade
-  minConf:        0.38,   // signal filter
-  stopLossPct:    0.003,  // 0.3% stop loss — ultra tight, cut fast
-  takeProfitPct:  0.005,  // 0.5% take profit — take it and move on
-  cooldownMs:     15000,  // 15s cooldown — re-enter quickly after exit
-  maxHoldMs:      300000, // 5 min max hold — scalps don't linger
-  topN:           12,     // show all pairs
-  maxConcurrent:  6,      // max 6 open positions at once for diversity
-  minEntryConf:   0.50,   // 50% signal agreement — majority rules
+  maxPosPct:      0.06,
+  maxPosFlat:     300,
+  minPosDollar:   5,
+  minConf:        0.38,
+  stopLossPct:    0.003,
+  takeProfitPct:  0.005,
+  cooldownMs:     15000,
+  maxHoldMs:      300000,
+  topN:           12,
+  maxConcurrent:  6,
+  minEntryConf:   0.50,
 };
 
 // Stock long-term config
@@ -642,6 +641,26 @@ function DashScreen({defaultProfile}) {
   }
 
   const [demoModeApplied, setDemoModeApplied] = useState(true);
+
+  // ── TUNING PARAMETERS — live adjustable ──────────────────────────
+  const [takeProfit,   setTakeProfit]   = useState(0.5);   // %
+  const [stopLoss,     setStopLoss]     = useState(0.3);   // %
+  const [maxPerTrade,  setMaxPerTrade]  = useState(300);   // $
+  const [maxPositions, setMaxPositions] = useState(6);     // count
+  const [minSignals,   setMinSignals]   = useState(2);     // 2 or 3
+  const [cooldown,     setCooldown]     = useState(15);    // seconds
+  const [maxHold,      setMaxHold]      = useState(5);     // minutes
+
+  // Apply tuning params to CRYPTO_CFG whenever they change
+  useEffect(()=>{
+    CRYPTO_CFG.takeProfitPct = takeProfit  / 100;
+    CRYPTO_CFG.stopLossPct   = stopLoss    / 100;
+    CRYPTO_CFG.maxPosFlat    = maxPerTrade;
+    CRYPTO_CFG.maxConcurrent = maxPositions;
+    CRYPTO_CFG.minEntryConf  = minSignals === 3 ? 0.84 : 0.50;
+    CRYPTO_CFG.cooldownMs    = cooldown * 1000;
+    CRYPTO_CFG.maxHoldMs     = maxHold  * 60 * 1000;
+  },[takeProfit, stopLoss, maxPerTrade, maxPositions, minSignals, cooldown, maxHold]);
 
   // Real order submission — fires alongside internal state update
   async function submitCryptoOrder(ticker, side, sizeUsd) {
@@ -2422,6 +2441,68 @@ function DashScreen({defaultProfile}) {
               </div>
             </div>
           )}
+
+          {/* ── Tuning Parameters ────────────────────────────────── */}
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:11,fontWeight:700,color:T.yellow,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:14}}>⚡ Signal Parameters</div>
+
+            {/* Win/loss math preview */}
+            <div style={{background:"#000",border:`1px solid ${T.border}`,borderRadius:8,padding:"10px 14px",marginBottom:14,display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,textAlign:"center"}}>
+              <div>
+                <div style={{fontSize:9,color:T.muted,marginBottom:2}}>WIN</div>
+                <div style={{fontSize:14,fontWeight:800,color:T.green}}>+${(maxPerTrade*takeProfit/100).toFixed(2)}</div>
+              </div>
+              <div>
+                <div style={{fontSize:9,color:T.muted,marginBottom:2}}>LOSS</div>
+                <div style={{fontSize:14,fontWeight:800,color:T.red}}>-${(maxPerTrade*stopLoss/100).toFixed(2)}</div>
+              </div>
+              <div>
+                <div style={{fontSize:9,color:T.muted,marginBottom:2}}>BREAKEVEN</div>
+                <div style={{fontSize:14,fontWeight:800,color:T.white}}>{(stopLoss/(takeProfit+stopLoss)*100).toFixed(0)}% WR</div>
+              </div>
+            </div>
+
+            {[
+              {label:"Take Profit", value:takeProfit,  set:setTakeProfit,  min:0.1, max:3.0,  step:0.1, fmt:v=>`${v.toFixed(1)}%`,  color:T.green,  desc:"Exit when price rises this much"},
+              {label:"Stop Loss",   value:stopLoss,    set:setStopLoss,    min:0.1, max:2.0,  step:0.1, fmt:v=>`${v.toFixed(1)}%`,  color:T.red,    desc:"Exit when price drops this much"},
+              {label:"Max Per Trade",value:maxPerTrade,set:setMaxPerTrade, min:10,  max:1000, step:10,  fmt:v=>`$${v}`,             color:T.yellow, desc:"Max dollar size per position"},
+              {label:"Max Positions",value:maxPositions,set:setMaxPositions,min:1, max:12,   step:1,   fmt:v=>`${v}`,              color:T.white,  desc:"Max open positions at once"},
+              {label:"Cooldown",    value:cooldown,    set:setCooldown,    min:5,   max:300,  step:5,   fmt:v=>`${v}s`,             color:T.white,  desc:"Wait before re-entering same asset"},
+              {label:"Max Hold",    value:maxHold,     set:setMaxHold,     min:1,   max:60,   step:1,   fmt:v=>`${v}min`,           color:T.white,  desc:"Force exit after this long"},
+            ].map(p=>(
+              <div key={p.label} style={{marginBottom:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                  <div>
+                    <span style={{fontSize:12,fontWeight:700,color:T.white}}>{p.label}</span>
+                    <span style={{fontSize:10,color:T.muted,marginLeft:8}}>{p.desc}</span>
+                  </div>
+                  <span style={{fontSize:14,fontWeight:800,color:p.color,fontFamily:"'DM Mono',monospace",minWidth:52,textAlign:"right"}}>{p.fmt(p.value)}</span>
+                </div>
+                <input type="range" min={p.min} max={p.max} step={p.step} value={p.value}
+                  onChange={e=>p.set(parseFloat(e.target.value))}
+                  style={{width:"100%",accentColor:T.red,cursor:"pointer"}}/>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:T.muted,marginTop:2}}>
+                  <span>{p.fmt(p.min)}</span><span>{p.fmt(p.max)}</span>
+                </div>
+              </div>
+            ))}
+
+            {/* Min signals toggle */}
+            <div style={{marginBottom:8}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.white,marginBottom:4}}>
+                Minimum Signals to Trade
+                <span style={{fontSize:10,color:T.muted,marginLeft:8}}>How many of 3 must agree</span>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                <button className={`schip${minSignals===2?" on":""}`} onClick={()=>setMinSignals(2)}>
+                  2 of 3 — More trades
+                </button>
+                <button className={`schip${minSignals===3?" on":""}`} onClick={()=>setMinSignals(3)}>
+                  3 of 3 — High conviction
+                </button>
+              </div>
+            </div>
+          </div>
 
           {/* ── Apply button ─────────────────────────────────────── */}
           <button className="rdbtn start" style={{width:"100%",padding:14,fontSize:14}} onClick={()=>{setSettingsOpen(false);setActive(false);setDataReady(false);}}>
