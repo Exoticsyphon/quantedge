@@ -168,7 +168,9 @@ function seedHistory(base, len=80) {
 
 function tickSeed(prices, beta=1){
   const last=prices[prices.length-1];
-  return [...prices.slice(1),+(last+(Math.random()-0.495)*last*0.006*beta).toFixed(last<1?6:2)];
+  // More volatile ticks so TP/SL actually get hit during testing
+  const change = (Math.random()-0.48)*last*0.012*beta;
+  return [...prices.slice(1),+(last+change).toFixed(last<1?6:2)];
 }
 const FH_RATE = {
   tokens: 55,
@@ -659,7 +661,8 @@ function DashScreen({defaultProfile}) {
   const [maxPositions, setMaxPositions] = useState(6);     // count
   const [minSignals,   setMinSignals]   = useState(2);     // 2 or 3
   const [cooldown,     setCooldown]     = useState(15);    // seconds
-  const [maxHold,      setMaxHold]      = useState(5);     // minutes
+  const [maxHold,      setMaxHold]      = useState(5);
+  const [maxDrawdown,  setMaxDrawdown]  = useState(50);  // % before safety stop
 
   // Apply tuning params to CRYPTO_CFG whenever they change
   useEffect(()=>{
@@ -726,6 +729,7 @@ function DashScreen({defaultProfile}) {
   const [toasts,   setToasts]   = useState([]);
   const [tick,     setTick]     = useState(0);
   const [dataReady,setDataReady]= useState(false);
+  const [debugLog, setDebugLog] = useState([]);
   const [loading,  setLoading]  = useState("Connecting to markets…");
   const [priceAge, setPriceAge] = useState({});
 
@@ -1181,11 +1185,16 @@ function DashScreen({defaultProfile}) {
     if (!active||halted) return;
     const now = Date.now();
     const cw  = cwRef.current;
-
     const priceKeys = Object.keys(cryptoPrices);
-    console.log(`[Crypto tick=${tick}] active=${active} prices=${priceKeys.length} cash=${cw.cash} positions=${Object.keys(cw.positions).length}`);
 
-    if (priceKeys.length === 0) { console.log("[Crypto] NO PRICES YET"); return; }
+    const dbg = (msg) => {
+      console.log(msg);
+      setDebugLog(p=>[{t:new Date().toLocaleTimeString(),m:msg},...p.slice(0,19)]);
+    };
+
+    dbg(`Tick #${tick} | prices:${priceKeys.length} | cash:$${cw.cash?.toFixed(2)} | pos:${Object.keys(cw.positions).length}`);
+
+    if (priceKeys.length === 0) { dbg("❌ NO PRICES"); return; }
 
     // Compute live signals right now from current prices
     const liveSigs = CRYPTO_UNIVERSE.map(t=>{
@@ -1202,14 +1211,21 @@ function DashScreen({defaultProfile}) {
     // Also update the displayed opps
     setCryptoOpps([...liveSigs].sort((a,b)=>Math.abs(b.score)-Math.abs(a.score)));
 
-    if (!liveSigs.length) return;
+    if (!liveSigs.length) { dbg("❌ No valid signals"); return; }
 
     const pv = cw.cash + Object.entries(cw.positions).reduce((a,[t,h])=>{
       const p=cryptoPrices[t]?.[cryptoPrices[t]?.length-1]||h.avgPrice;
       return a+h.qty*p;
     },0);
 
-    if (pv < cw.peak*(1-0.08)) { setHalted(true); setActive(false); addToast("🛑 Safety stop — 8% drawdown","halt"); return; }
+    // Safety stop — only triggers after meaningful trading activity
+    // 50% drawdown threshold to avoid false stops on small budgets
+    const closedTrades = tRef.current.filter(t=>t.pnl!==null).length;
+    if (closedTrades >= 5 && pv < cw.peak*(1-(maxDrawdown/100))) {
+      setHalted(true); setActive(false);
+      addToast(`🛑 Safety stop — ${maxDrawdown}% drawdown`,"halt");
+      return;
+    }
     if (pv > cw.peak) setCryptoWallet(w=>({...w,peak:pv}));
 
     // Exit existing positions
@@ -1217,9 +1233,13 @@ function DashScreen({defaultProfile}) {
       const prices=cryptoPrices[ticker]; if(!prices||!prices.length) return;
       const price=prices[prices.length-1];
       const hitSL=price<=h.stopLoss, hitTP=price>=h.takeProfit;
+      const heldMs = now - (h.entryTime||now);
+      // Minimum hold 30s before any exit — prevents immediate reversal exits
+      if(heldMs < 30000) return;
+      // Signal reversal only on very high conviction (all 3 signals flipped)
       const curSig=liveSigs.find(o=>o.ticker===ticker);
-      const reversed=curSig&&curSig.action==="SELL"&&curSig.conf>=0.6;
-      const tooLong=h.entryTime&&(now-h.entryTime)>CRYPTO_CFG.maxHoldMs;
+      const reversed=curSig&&curSig.action==="SELL"&&curSig.conf>=0.85;
+      const tooLong=heldMs>CRYPTO_CFG.maxHoldMs;
       if(!hitSL&&!hitTP&&!reversed&&!tooLong) return;
       const reason=hitSL?"STOP_LOSS":hitTP?"TAKE_PROFIT":reversed?"SIGNAL_REVERSAL":"TIME_EXIT";
       const proceeds=+(h.qty*price).toFixed(2), pnl=+((price-h.avgPrice)*h.qty).toFixed(2);
@@ -1233,44 +1253,37 @@ function DashScreen({defaultProfile}) {
 
     const openCount=Object.keys(cw.positions).length;
     const slotsAvail=CRYPTO_CFG.maxConcurrent-openCount;
-    if(slotsAvail<=0||cw.cash<=0) return;
 
-    // Scale position size to budget — use percentage of available cash
     const bucketValue = Math.max(pv, cw.cash);
-    const perTradeCap = Math.min(
-      bucketValue * CRYPTO_CFG.maxPosPct,  // % of portfolio
-      CRYPTO_CFG.maxPosFlat,               // hard cap
-      cw.cash * 0.95                       // never use all cash
-    );
-    const minTrade = Math.max(1, bucketValue * 0.02); // at least 2% of budget, min $1
+    const perTradeCap = Math.min(bucketValue * CRYPTO_CFG.maxPosPct, CRYPTO_CFG.maxPosFlat, cw.cash * 0.95);
+    const minTrade = Math.max(0.10, bucketValue * 0.01); // 1% of budget, min 10 cents
 
-    const entries = liveSigs
-      .filter(sig=>{
-        if(sig.action==="HOLD") return false;
-        if(cw.positions[sig.ticker]) return false;
-        if((cooldowns.current[sig.ticker]||0)>now) return false;
-        if(cw.cash < CRYPTO_CFG.minPosDollar) return false;
-        return true;
-      })
+    dbg(`Slots:${slotsAvail} Cash:$${cw.cash?.toFixed(2)} PerTrade:$${perTradeCap?.toFixed(2)} Min:$${minTrade?.toFixed(2)}`);
+
+    if(slotsAvail<=0) { dbg("❌ No slots available"); return; }
+    if(cw.cash<=minTrade) { dbg(`❌ Not enough cash $${cw.cash?.toFixed(2)} < $${minTrade?.toFixed(2)}`); return; }
+
+    const buySigs = liveSigs.filter(s=>s.action==="BUY"&&!cw.positions[s.ticker]&&!(cooldowns.current[s.ticker]>now));
+    const sellSigs = liveSigs.filter(s=>s.action==="SELL"&&!cw.positions[s.ticker]&&!(cooldowns.current[s.ticker]>now));
+    const entries = (buySigs.length ? buySigs : sellSigs)
       .sort((a,b)=>Math.abs(b.score)-Math.abs(a.score))
       .slice(0, Math.min(slotsAvail, 4));
 
-    console.log(`[Crypto] candidates=${liveSigs.length} entries=${entries.length} cash=${cw.cash} slots=${slotsAvail}`);
-    if (entries.length===0) console.log("[Crypto] No entries — signals:", liveSigs.map(s=>`${s.ticker}:${s.action}(${s.score?.toFixed(2)})`).join(", "));
+    dbg(`BuySigs:${buySigs.length} SellSigs:${sellSigs.length} Entries:${entries.length}`);
 
     entries.forEach(sig=>{
-      if(cw.cash<=0) return;
-      const size=Math.min(perTradeCap*(0.5+sig.conf*0.5), cw.cash*0.95);
-      if(size<minTrade) return;
+      if(cw.cash<=minTrade) return;
+      const size = Math.min(perTradeCap, cw.cash * 0.95);
+      if(size < minTrade) { dbg(`❌ Size $${size.toFixed(2)} < min $${minTrade.toFixed(2)}`); return; }
       const qty=+(size/sig.price).toFixed(sig.price<1?6:4);
       const sl=+(sig.price*(1-CRYPTO_CFG.stopLossPct)).toFixed(sig.price<1?6:2);
       const tp=+(sig.price*(1+CRYPTO_CFG.takeProfitPct)).toFixed(sig.price<1?6:2);
-      console.log(`[Crypto] BUYING ${sig.ticker} @ $${sig.price} size=$${size.toFixed(2)} conf=${sig.conf} score=${sig.score}`);
-      setCryptoWallet(w=>({...w,cash:+(w.cash-size).toFixed(2),positions:{...w.positions,[sig.ticker]:{qty,avgPrice:sig.price,stopLoss:sl,takeProfit:tp,news:sig.newsItems,entryTime:now}}}));
+      dbg(`✅ BUYING ${sig.ticker} $${size.toFixed(2)} @ $${sig.price}`);
+      setCryptoWallet(w=>({...w,cash:+(w.cash-size).toFixed(2),positions:{...w.positions,[sig.ticker]:{qty,avgPrice:sig.price,stopLoss:sl,takeProfit:tp,news:[],entryTime:now}}}));
       submitCryptoOrder(sig.ticker,"buy",size,sig.price);
-      const story=tradeStory(CRYPTO_META[sig.ticker]?.name||sig.ticker,"BUY",sig.price,null,sig.conf,sig.newsItems,"crypto");
+      const story=tradeStory(CRYPTO_META[sig.ticker]?.name||sig.ticker,"BUY",sig.price,null,sig.conf,[],"crypto");
       setTrades(prev=>[{id:Date.now()+Math.random(),ticker:sig.ticker,name:CRYPTO_META[sig.ticker]?.name||sig.ticker,action:"BUY",price:sig.price,qty,total:+size.toFixed(2),pnl:null,time:new Date().toLocaleTimeString(),engine:"crypto",story},...prev.slice(0,299)]);
-      addToast(`⚡ ${CRYPTO_META[sig.ticker]?.name||sig.ticker} $${size.toFixed(0)} · ${(sig.conf*100).toFixed(0)}%`,"buy");
+      addToast(`⚡ ${CRYPTO_META[sig.ticker]?.name||sig.ticker} $${size.toFixed(2)}`,"buy");
       cooldowns.current[sig.ticker]=now+CRYPTO_CFG.cooldownMs;
     });
   },[tick, cryptoPrices, active, halted]);
@@ -1442,7 +1455,7 @@ function DashScreen({defaultProfile}) {
   const totalPV = cryptoPV + stockPV;
   const totalStart = profile.initialCapital;
   const totalPnL = trades.filter(t=>t.pnl!==null).reduce((a,t)=>a+t.pnl,0);
-  const wins=trades.filter(t=>t.pnl!==null&&t.pnl>=0).length, losses=trades.filter(t=>t.pnl!==null&&t.pnl<0).length;
+  const wins=trades.filter(t=>t.pnl!==null&&t.pnl>0.001).length, losses=trades.filter(t=>t.pnl!==null&&t.pnl<-0.001).length;
   const winRate=(wins+losses)>0?wins/(wins+losses):null;
   const roi=((totalPV-totalStart)/totalStart*100);
   const regColors={BULL:"#10b981",BEAR:"#ef4444",HIGH_FEAR:"#f97316",ELEVATED:"#f59e0b",NEUTRAL:"#3b82f6"};
@@ -1797,6 +1810,18 @@ function DashScreen({defaultProfile}) {
 
             {/* Recent activity feed */}
             <div className="card">
+              {/* Debug panel — shows exactly what bot is doing each tick */}
+              {active&&debugLog.length>0&&(
+                <div className="card" style={{marginBottom:10,borderColor:T.yellow+"44"}}>
+                  <div style={{fontSize:10,fontWeight:700,color:T.yellow,marginBottom:6,letterSpacing:"0.06em",textTransform:"uppercase"}}>🔍 Live Debug</div>
+                  {debugLog.slice(0,8).map((l,i)=>(
+                    <div key={i} style={{fontSize:10,color:l.m.startsWith("✅")?T.green:l.m.startsWith("❌")?T.red:T.muted,padding:"2px 0",fontFamily:"'DM Mono',monospace",lineHeight:1.4}}>
+                      <span style={{color:T.muted,marginRight:6}}>{l.t}</span>{l.m}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div style={{fontSize:11,fontWeight:700,color:T.muted,letterSpacing:"0.06em",textTransform:"uppercase",marginBottom:10}}>What the bot did</div>
               {!trades.length?(
                 <div style={{textAlign:"center",padding:"20px 0",color:T.muted}}>
@@ -2476,7 +2501,8 @@ function DashScreen({defaultProfile}) {
               {label:"Max Per Trade",value:maxPerTrade,set:setMaxPerTrade, min:10,  max:1000, step:10,  fmt:v=>`$${v}`,             color:T.yellow, desc:"Max dollar size per position"},
               {label:"Max Positions",value:maxPositions,set:setMaxPositions,min:1, max:12,   step:1,   fmt:v=>`${v}`,              color:T.white,  desc:"Max open positions at once"},
               {label:"Cooldown",    value:cooldown,    set:setCooldown,    min:5,   max:300,  step:5,   fmt:v=>`${v}s`,             color:T.white,  desc:"Wait before re-entering same asset"},
-              {label:"Max Hold",    value:maxHold,     set:setMaxHold,     min:1,   max:60,   step:1,   fmt:v=>`${v}min`,           color:T.white,  desc:"Force exit after this long"},
+              {label:"Max Hold",    value:maxHold,     set:setMaxHold,     min:1,   max:60,   step:1,   fmt:v=>`${v}min`, color:T.white,  desc:"Force exit after this long"},
+              {label:"Safety Stop", value:maxDrawdown, set:setMaxDrawdown, min:5,   max:100,  step:5,   fmt:v=>`${v}%`,   color:T.red,    desc:"Halt bot after this % loss (after 5 trades)"},
             ].map(p=>(
               <div key={p.label} style={{marginBottom:14}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
