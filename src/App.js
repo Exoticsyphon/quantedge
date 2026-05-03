@@ -13,17 +13,17 @@ const STOCK_CAPITAL_PCT  = 0.35;
 
 // Crypto scalper config — values overridden at runtime by settings panel
 const CRYPTO_CFG = {
-  maxPosPct:      0.06,
-  maxPosFlat:     300,
-  minPosDollar:   5,
-  minConf:        0.38,
+  maxPosPct:      0.20,   // 20% per position — allows trading at any budget
+  maxPosFlat:     500,    // $500 hard cap for large budgets
+  minPosDollar:   0.50,   // 50 cents minimum — works at any scale
+  minConf:        0.33,
   stopLossPct:    0.003,
   takeProfitPct:  0.005,
   cooldownMs:     15000,
   maxHoldMs:      300000,
   topN:           12,
   maxConcurrent:  6,
-  minEntryConf:   0.50,
+  minEntryConf:   0.33,
 };
 
 // Stock long-term config
@@ -395,7 +395,8 @@ function cryptoSignal(ticker, prices) {
   const signals = [s1, s2, s3];
   const bullish  = signals.filter(s => s > 0).length;
   const bearish  = signals.filter(s => s < 0).length;
-  const strength = signals.reduce((a,s) => a + Math.abs(s), 0); // max 6
+  const strength = signals.reduce((a,s) => a + Math.abs(s), 0);
+  const score    = (bullish - bearish) / 3;
 
   let action = "HOLD";
   let conf   = 0;
@@ -406,9 +407,16 @@ function cryptoSignal(ticker, prices) {
   } else if (bearish >= 2) {
     action = "SELL";
     conf   = bearish === 3 ? (strength >= 5 ? 1.0 : 0.85) : 0.65;
+  } else if (bullish > bearish) {
+    action = "BUY";
+    conf   = 0.40;
+  } else if (bearish > bullish) {
+    action = "SELL";
+    conf   = 0.40;
+  } else {
+    action = score >= 0 ? "BUY" : "SELL";
+    conf   = 0.33;
   }
-
-  const score = (bullish - bearish) / 3;
 
   const reason = bullish === 3 ? "🟢 All 3 signals agree — strong buy"
     : bearish === 3            ? "🔴 All 3 signals agree — strong sell"
@@ -1125,12 +1133,11 @@ function DashScreen({defaultProfile}) {
       tickRef.current = setInterval(()=>{
         lastTickTime.current = Date.now();
         setTick(n=>n+1);
-        // In demo mode, tick prices forward with seeded randomness
         if (demoMode) {
           setCryptoPrices(prev=>{ const nx={};Object.entries(prev).forEach(([t,p])=>{nx[t]=tickSeed(p,CRYPTO_META[t]?.beta||1);}); return nx; });
           setStockPrices(prev=>{ const nx={};Object.entries(prev).forEach(([s,p])=>{nx[s]=tickSeed(p,1.2);}); return nx; });
         }
-      }, 5000);
+      }, 2000); // 2s tick for high frequency scalping
     }
     startTick();
     const watchdog = setInterval(()=>{ if(Date.now()-lastTickTime.current>12000) startTick(); },6000);
@@ -1224,38 +1231,37 @@ function DashScreen({defaultProfile}) {
       cooldowns.current[ticker]=now+CRYPTO_CFG.cooldownMs;
     });
 
-    // Enter new positions
     const openCount=Object.keys(cw.positions).length;
     const slotsAvail=CRYPTO_CFG.maxConcurrent-openCount;
-    if(slotsAvail<=0||cw.cash<CRYPTO_CFG.minPosDollar) return;
+    if(slotsAvail<=0||cw.cash<=0) return;
 
-    const perTradeCap=Math.min(pv*CRYPTO_CFG.maxPosPct,CRYPTO_CFG.maxPosFlat);
+    // Scale position size to budget — use percentage of available cash
+    const bucketValue = Math.max(pv, cw.cash);
+    const perTradeCap = Math.min(
+      bucketValue * CRYPTO_CFG.maxPosPct,  // % of portfolio
+      CRYPTO_CFG.maxPosFlat,               // hard cap
+      cw.cash * 0.95                       // never use all cash
+    );
+    const minTrade = Math.max(1, bucketValue * 0.02); // at least 2% of budget, min $1
 
-    const entries=liveSigs
+    const entries = liveSigs
       .filter(sig=>{
         if(sig.action==="HOLD") return false;
         if(cw.positions[sig.ticker]) return false;
         if((cooldowns.current[sig.ticker]||0)>now) return false;
-        if(sig.conf < 0.60) return false; // require at least 2/3 signals agreeing
         if(cw.cash < CRYPTO_CFG.minPosDollar) return false;
         return true;
       })
-      .sort((a,b)=>b.conf-a.conf) // highest conviction first
-      .slice(0,Math.min(slotsAvail,4));
+      .sort((a,b)=>Math.abs(b.score)-Math.abs(a.score))
+      .slice(0, Math.min(slotsAvail, 4));
 
-    // If nothing at 60%+ conf, try 2/3 signals (conf=0.65) anyway
-    const finalEntries = entries.length > 0 ? entries :
-      liveSigs
-        .filter(sig=>sig.action!=="HOLD"&&!cw.positions[sig.ticker]&&!(cooldowns.current[sig.ticker]>now)&&sig.conf>=0.60)
-        .sort((a,b)=>b.strength-a.strength)
-        .slice(0,Math.min(slotsAvail,2));
+    console.log(`[Crypto] candidates=${liveSigs.length} entries=${entries.length} cash=${cw.cash} slots=${slotsAvail}`);
+    if (entries.length===0) console.log("[Crypto] No entries — signals:", liveSigs.map(s=>`${s.ticker}:${s.action}(${s.score?.toFixed(2)})`).join(", "));
 
-    console.log(`[Crypto] entries=${entries.length} finalEntries=${finalEntries.length}`);
-
-    finalEntries.forEach(sig=>{
-      if(cw.cash<CRYPTO_CFG.minPosDollar) return;
-      const size=Math.min(perTradeCap*(0.5+sig.conf*0.5),cw.cash*0.92);
-      if(size<CRYPTO_CFG.minPosDollar) return;
+    entries.forEach(sig=>{
+      if(cw.cash<=0) return;
+      const size=Math.min(perTradeCap*(0.5+sig.conf*0.5), cw.cash*0.95);
+      if(size<minTrade) return;
       const qty=+(size/sig.price).toFixed(sig.price<1?6:4);
       const sl=+(sig.price*(1-CRYPTO_CFG.stopLossPct)).toFixed(sig.price<1?6:2);
       const tp=+(sig.price*(1+CRYPTO_CFG.takeProfitPct)).toFixed(sig.price<1?6:2);
@@ -2508,13 +2514,17 @@ function DashScreen({defaultProfile}) {
 
           {/* ── Apply button ─────────────────────────────────────── */}
           <button className="rdbtn start" style={{width:"100%",padding:14,fontSize:14}} onClick={()=>{
+            const cap = customCap ? parseInt(customCap)||CAPITALS[capitalIdx] : CAPITALS[capitalIdx];
+            const cryptoCap = Math.round(cap * CRYPTO_CAPITAL_PCT);
+            const stockCap  = Math.round(cap * STOCK_CAPITAL_PCT);
             setSettingsOpen(false);
             setActive(false);
             setHalted(false);
-            setDataReady(false);
             setTrades([]);
-            setCryptoWallet({cash:profile.cryptoCapital,positions:{},peak:profile.cryptoCapital});
-            setStockWallet({cash:profile.stockCapital,positions:{},peak:profile.stockCapital,lastRebalance:Date.now(),lastDailyRotation:0});
+            setCryptoWallet({cash:cryptoCap, positions:{}, peak:cryptoCap});
+            setStockWallet({cash:stockCap, positions:{}, peak:stockCap, lastRebalance:Date.now(), lastDailyRotation:0});
+            setTick(0);
+            setDataReady(false);
             setLoadKey(k=>k+1);
           }}>
             Apply & Restart Engine
